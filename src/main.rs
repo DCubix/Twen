@@ -22,7 +22,8 @@ use std::fs;
 use std::path::Path;
 
 struct AudioOutput {
-	rx: Receiver<Vec<f32>>
+	rx: Receiver<Vec<f32>>,
+	cs: Sender<Vec<f32>>,
 }
 
 impl AudioCallback for AudioOutput {
@@ -31,6 +32,7 @@ impl AudioCallback for AudioOutput {
 	fn callback(&mut self, out: &mut [f32]) {
 		let data = self.rx.recv().unwrap();
 		out.copy_from_slice(&data);
+		self.cs.send(data).unwrap();
 	}
 }
 
@@ -42,6 +44,7 @@ fn main() {
 	let window = video
 		.window("Twen", 640, 480)
 		.position_centered()
+		.set_window_flags(sdl2::sys::SDL_WindowFlags::SDL_WINDOW_ALWAYS_ON_TOP as u32)
 		.build()
 		.unwrap();
 	let mut canvas = window.into_canvas().build().unwrap();
@@ -52,10 +55,11 @@ fn main() {
 		samples: Some(1024)
 	};
 
-	let (mut audioSender, audioRecv) = mpsc::channel();
+	let (audioSender, rx) = mpsc::channel();
+	let (cs, audioReceiver) = mpsc::channel();
 	let mut device = audio.open_playback(None, &desired_spec, |spec| {
 		AudioOutput {
-			rx: audioRecv
+			rx, cs
 		}
 	}).unwrap();
 	device.resume();
@@ -63,7 +67,6 @@ fn main() {
 	// Synth file
 	let path = Path::new("synth.twg");
 	if !path.exists() {
-		File::create(path).expect("Failed to create file.");
 		fs::write(path, "Output(0.0)").expect("Failed to write to file.");
 	}
 
@@ -73,15 +76,21 @@ fn main() {
 
 	// File changes listener
 	let (tx, rx) = mpsc::channel();
-	let mut watcher = notify::watcher(tx, Duration::from_secs(1)).expect("Failed to watch file.");
-	watcher.watch(path, RecursiveMode::NonRecursive).unwrap();
+	notify::watcher(tx, Duration::from_millis(1000))
+			.expect("Failed to watch file.")
+			.watch(path, RecursiveMode::NonRecursive).unwrap();
+
+	let mut init_samples = Vec::new();
+	for _ in 0..1024 {
+		init_samples.push(graph.sample());
+	}
+	audioSender.send(init_samples).unwrap();
 
 	let mut event_pump = sdl.event_pump().unwrap();
 	'running: loop {
 		for event in rx.try_iter() {
 			match event {
 				DebouncedEvent::NoticeRemove(_) => {
-					File::create(path).expect("Failed to create file.");
 					fs::write(path, "Output(0.0)").expect("Failed to write to file.");
 					let mut loader = GraphLoader::new(path.to_str().unwrap());
 					graph = loader.load();
@@ -104,12 +113,11 @@ fn main() {
 			}
 		}
 
-		let mut samples = Vec::new();
-		for _ in 0..1024 {
-			samples.push(graph.sample());
+		let mut samples = audioReceiver.recv().unwrap();
+		for i in 0..1024 {
+			samples[i] = graph.sample();
 		}
-		let samples_data = samples.clone();
-		audioSender.send(samples).unwrap();
+		audioSender.send(samples.clone()).unwrap();
 
 		canvas.set_draw_color(Color::RGB(0, 0, 0));
 		canvas.clear();
@@ -120,7 +128,7 @@ fn main() {
 		let mut py = 240;
 		let step = 640.0 / 512.0;
 		for i in (0..640).step_by(step as usize) {
-			let s = (samples_data[640 - i] * 400.0) as i32;
+			let s = (samples[640 - i] * 400.0) as i32;
 			let y = 240 - s;
 
 			canvas.draw_line(Point::new(px, py), Point::new(i as i32, y));
@@ -130,6 +138,7 @@ fn main() {
 		}
 
 		canvas.present();
-		::std::thread::sleep(Duration::new(0, 1_000_000_000u32 / 60));
 	}
+
+	println!("Bye!");
 }
